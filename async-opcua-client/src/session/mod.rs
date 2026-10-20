@@ -172,6 +172,9 @@ pub(super) enum SessionState {
     Disconnected,
     Connected,
     Connecting,
+    /// The event loop is gone (it gave up reconnecting, the session was closed, or it was
+    /// dropped or aborted). Nothing will ever change the state again.
+    Terminated,
 }
 
 static NEXT_SESSION_ID: AtomicU32 = AtomicU32::new(1);
@@ -283,16 +286,22 @@ impl Session {
     }
 
     /// Wait for the session to be in either a connected or disconnected state.
+    ///
+    /// Also returns once the event loop has ended, since the state can no longer change:
+    /// that counts as "disconnected", so waiting for a connection yields `false` and waiting
+    /// for a disconnection yields `true`.
     async fn wait_for_state(&self, connected: bool) -> bool {
         let mut rx = self.state_watch_rx.clone();
 
         let res = rx
             .wait_for(|s| {
-                connected && matches!(*s, SessionState::Connected)
+                matches!(*s, SessionState::Terminated)
+                    || connected && matches!(*s, SessionState::Connected)
                     || !connected && matches!(*s, SessionState::Disconnected)
             })
             .await
-            .is_ok();
+            .map(|s| !matches!(*s, SessionState::Terminated) || !connected)
+            .unwrap_or(false);
 
         // Compiler limitation
         res
@@ -311,7 +320,10 @@ impl Session {
 
     /// Convenience method to wait for a connection to the server.
     ///
-    /// You should also monitor the session event loop. If it ends, this method will never return.
+    /// Returns `true` once the session is connected, and `false` if the session event loop ends
+    /// before that (for example because it failed to connect and has no retries left, or the
+    /// session was closed). The reason the loop ended is the status returned by
+    /// [`SessionEventLoop::run`], or the error of the stream from [`SessionEventLoop::enter`].
     pub async fn wait_for_connection(&self) -> bool {
         self.wait_for_state(true).await
     }

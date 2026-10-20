@@ -75,6 +75,14 @@ pub struct SessionEventLoop<T: Connector + Send + Sync + 'static> {
     connector: T,
 }
 
+impl<T: Connector + Send + Sync + 'static> Drop for SessionEventLoop<T> {
+    /// However the loop ends (finished, failed, dropped before it ran, or its task aborted),
+    /// tell the waiters of the session, so `Session::wait_for_connection` cannot hang forever.
+    fn drop(&mut self) {
+        let _ = self.inner.state_watch_tx.send(SessionState::Terminated);
+    }
+}
+
 impl<T: Connector + Send + Sync + 'static> SessionEventLoop<T> {
     pub(crate) fn new(
         inner: Arc<Session>,
