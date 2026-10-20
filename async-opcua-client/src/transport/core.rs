@@ -18,6 +18,15 @@ use opcua_types::{Error, StatusCode, UAString};
 use crate::transport::state::SecureChannelState;
 use crate::transport::RequestRecv;
 
+/// A copy of `error` for a second recipient (`Error` is not `Clone`): same status and same cause,
+/// tagged with the request it belongs to.
+fn copy_error(error: &Error, request_id: u32) -> Error {
+    let cause = std::error::Error::source(error)
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    Error::new(error.status(), cause).with_request_id(request_id)
+}
+
 #[derive(Debug)]
 struct MessageChunkWithChunkInfo {
     header: ChunkInfo,
@@ -306,14 +315,26 @@ impl TransportState {
                 drop(_h);
                 let message_state = self.message_states.remove(&req_id).unwrap();
                 let _h = message_state.span.enter();
-                let in_chunks = Self::merge_chunks(message_state.chunks).inspect_err(|e| {
-                    error!("Failed to merge chunks for message, request_id = {req_id}: {e}");
-                })?;
-                let message = self
-                    .turn_received_chunks_into_message(&in_chunks)
-                    .inspect_err(|e| {
-                        error!("Failed to decode incoming message, request_id = {req_id}: {e}")
-                    })?;
+                // The request is already out of `message_states`, so if this message cannot be
+                // read the transport closes (the stream cannot be trusted any more) and nobody else
+                // will answer it. Tell the caller why instead of dropping its reply channel, which
+                // surfaced only as a generic "connection closed" with the cause left in the log.
+                let in_chunks = match Self::merge_chunks(message_state.chunks) {
+                    Ok(chunks) => chunks,
+                    Err(e) => {
+                        error!("Failed to merge chunks for message, request_id = {req_id}: {e}");
+                        let _ = message_state.callback.send(Err(copy_error(&e, req_id)));
+                        return Err(e);
+                    }
+                };
+                let message = match self.turn_received_chunks_into_message(&in_chunks) {
+                    Ok(message) => message,
+                    Err(e) => {
+                        error!("Failed to decode incoming message, request_id = {req_id}: {e}");
+                        let _ = message_state.callback.send(Err(copy_error(&e, req_id)));
+                        return Err(e);
+                    }
+                };
 
                 // If the message is a response to opening a secure channel, we need to update encryption keys
                 // right now. If we wait, we risk new messages using the new encryption keys arriving before
