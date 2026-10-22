@@ -306,14 +306,28 @@ impl TransportState {
                 drop(_h);
                 let message_state = self.message_states.remove(&req_id).unwrap();
                 let _h = message_state.span.enter();
-                let in_chunks = Self::merge_chunks(message_state.chunks).inspect_err(|e| {
-                    error!("Failed to merge chunks for message, request_id = {req_id}: {e}");
-                })?;
-                let message = self
-                    .turn_received_chunks_into_message(&in_chunks)
-                    .inspect_err(|e| {
-                        error!("Failed to decode incoming message, request_id = {req_id}: {e}")
-                    })?;
+                // The request is already out of `message_states`. If we can't read the message the
+                // transport closes and nobody else will answer it, so tell the caller what went wrong.
+                let in_chunks = match Self::merge_chunks(message_state.chunks) {
+                    Ok(chunks) => chunks,
+                    Err(e) => {
+                        error!("Failed to merge chunks for message, request_id = {req_id}: {e}");
+                        let _ = message_state
+                            .callback
+                            .send(Err(e.clone().with_request_id(req_id)));
+                        return Err(e);
+                    }
+                };
+                let message = match self.turn_received_chunks_into_message(&in_chunks) {
+                    Ok(message) => message,
+                    Err(e) => {
+                        error!("Failed to decode incoming message, request_id = {req_id}: {e}");
+                        let _ = message_state
+                            .callback
+                            .send(Err(e.clone().with_request_id(req_id)));
+                        return Err(e);
+                    }
+                };
 
                 // If the message is a response to opening a secure channel, we need to update encryption keys
                 // right now. If we wait, we risk new messages using the new encryption keys arriving before
